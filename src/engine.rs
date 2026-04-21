@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use crate::api::{current_bucket_ts, fetch_market_resolution, fetch_orderbook, resolve_market};
-use crate::chainlink::{fetch_price_fallback, PriceClient};
+use crate::binance::{fetch_price_rest, start_price_stream, SharedPrice};
 use crate::config::Config;
 use crate::csv_log;
 use crate::display::render;
@@ -25,20 +25,25 @@ pub struct AppState {
     pub cached_slug: String,
 
     pub btc_price: f64,
-    pub beat_price: f64,   // Chainlink price at market start
+    pub beat_price: f64,  // Binance price captured at the moment the market bucket started
     pub candles: CandleHistory,
 
     pub orderbook: Orderbook,
 
     pub phase: MarketPhase,
-    pub bot_trades: Vec<BotTrade>,   // trades this market
-    pub all_trades: Vec<BotTrade>,   // all-time trades this session
+    pub bot_trades: Vec<BotTrade>,
+    pub all_trades: Vec<BotTrade>,
 
     pub poll_count: u64,
     pub last_tick_ms: u64,
     pub status_line: String,
 
-    // After-market snapshot for display
+    // Beat price pre-captured when the next market bucket is first detected.
+    // This is set even while the 25-sec post-market window is still running,
+    // so the new market starts with the price from exactly its bucket boundary.
+    pub next_beat_price: Option<f64>,
+
+    // After-market snapshot for display during the 25-sec window
     pub post_market_orderbook: Option<Orderbook>,
     pub post_market_winner: String,
     pub post_market_end_price: f64,
@@ -63,7 +68,8 @@ impl AppState {
             all_trades: Vec::new(),
             poll_count: 0,
             last_tick_ms: 0,
-            status_line: "Initializing...".to_string(),
+            status_line: "Initializing… connecting to Binance".to_string(),
+            next_beat_price: None,
             post_market_orderbook: None,
             post_market_winner: String::new(),
             post_market_end_price: 0.0,
@@ -74,7 +80,7 @@ impl AppState {
     }
 }
 
-// ── Shared render state (cloned for render task) ──────────────────────────────
+// ── Snapshot for render task ──────────────────────────────────────────────────
 
 pub struct RenderState {
     pub config: Config,
@@ -135,19 +141,24 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    let oracle = PriceClient::new(
-        http.clone(),
-        state.config.ds_api_key.clone(),
-        state.config.ds_api_secret.clone(),
-        state.config.ds_feed_id.clone(),
-        state.config.polygon_rpc_url.clone(),
-        state.config.chainlink_feed.clone(),
-    );
+    // Grab initial price via REST while the poll loop warms up
+    match fetch_price_rest(&http, &state.config.asset).await {
+        Ok(p) => {
+            state.btc_price = p;
+            state.candles.update(p);
+            state.status_line = format!(
+                "Binance initial price: ${:.2} — starting stream…", p
+            );
+        }
+        Err(e) => eprintln!("[Binance] initial REST fetch failed: {e}"),
+    }
 
-    // Spawn render task (redraws terminal every second)
+    // Start background 250 ms poll loop (updates SharedPrice in real-time)
+    let price_stream: SharedPrice = start_price_stream(http.clone(), &state.config.asset);
+
+    // Render task — redraws terminal every 500 ms
     let render_arc: Arc<Mutex<Option<RenderState>>> = Arc::new(Mutex::new(None));
     let render_clone = Arc::clone(&render_arc);
-
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_millis(500)).await;
@@ -162,32 +173,21 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
         state.poll_count += 1;
         let t0 = Instant::now();
 
-        // Fetch price: Chainlink Data Streams → on-chain aggregator → Binance
-        match oracle.latest_price().await {
-            Ok(p) => {
+        // Pull latest Binance price from shared stream
+        {
+            let p = *price_stream.lock().await;
+            if p > 0.0 {
                 state.btc_price = p;
                 state.candles.update(p);
             }
-            Err(e) => {
-                match fetch_price_fallback(&http, &state.config.asset).await {
-                    Ok(p) => {
-                        state.btc_price = p;
-                        state.candles.update(p);
-                    }
-                    Err(_) => {
-                        state.status_line = format!("Price fetch failed: {}", e);
-                    }
-                }
-            }
         }
 
-        if let Err(e) = tick(&mut state, &http, &oracle, &executor).await {
+        if let Err(e) = tick(&mut state, &http, &executor).await {
             state.status_line = format!("Error: {}", e);
         }
 
         state.last_tick_ms = t0.elapsed().as_millis() as u64;
 
-        // Push snapshot to render task
         {
             let mut guard = render_arc.lock().await;
             *guard = Some(RenderState::from_app(&state));
@@ -202,16 +202,28 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
 async fn tick(
     state: &mut AppState,
     http: &HttpClient,
-    oracle: &PriceClient,
     executor: &Arc<dyn Executor>,
 ) -> Result<()> {
     let cfg = &state.config;
-    let slug = format!("{}-{}", cfg.slug_prefix, current_bucket_ts(cfg.interval_secs));
+    let new_slug = format!("{}-{}", cfg.slug_prefix, current_bucket_ts(cfg.interval_secs));
 
-    // ── Phase state machine runs FIRST ────────────────────────────────────────
-    // This must come before the slug check so that when the market ends and the
-    // slug changes simultaneously, tick_active sets JustEnded before we decide
-    // whether to load the next market.
+    // ── Beat-price capture: runs even during the 25-sec window ────────────────
+    // The slug for the NEXT market becomes valid at the exact bucket boundary.
+    // We snapshot the Binance price at that moment so the new market's
+    // "price to beat" is the true starting price, not the post-window price.
+    if !new_slug.is_empty()
+        && new_slug != state.cached_slug
+        && !state.cached_slug.is_empty()
+        && state.next_beat_price.is_none()
+    {
+        state.next_beat_price = Some(state.btc_price);
+        eprintln!(
+            "[Engine] Saved next beat price ${:.2} for {}",
+            state.btc_price, new_slug
+        );
+    }
+
+    // ── Phase state machine ───────────────────────────────────────────────────
     match state.phase.clone() {
         MarketPhase::Active => {
             tick_active(state, http).await?;
@@ -219,44 +231,36 @@ async fn tick(
 
         MarketPhase::JustEnded { ended_at, winner, end_btc_price } => {
             let elapsed = Utc::now().timestamp() - ended_at;
-
             if elapsed >= state.config.post_market_secs as i64 {
-                // Trading window expired → allow slug check below to load next market
                 state.phase = MarketPhase::Transitioning;
-                state.status_line = "Market window closed, loading next market...".to_string();
+                state.status_line = "Post-market window closed, loading next market…".to_string();
             } else {
-                // Keep scanning for winner asks below $1.00 every tick during the window
-                let winner_clone = winner.clone();
-                let end_price = end_btc_price;
-                tick_just_ended(state, http, executor, &winner_clone, end_price, ended_at).await?;
+                let w = winner.clone();
+                tick_just_ended(state, http, executor, &w, end_btc_price, ended_at).await?;
             }
         }
 
         MarketPhase::Transitioning => {
-            state.status_line = "Waiting for next market...".to_string();
+            state.status_line = "Waiting for next market…".to_string();
         }
     }
 
-    // ── Market transition: skip while JustEnded trading window is active ──────
-    // The new market's slug is already valid, but we hold off loading it until
-    // the post-market buy window on the OLD market finishes.
-    let in_trading_window = matches!(state.phase, MarketPhase::JustEnded { .. });
-    if slug != state.cached_slug && !in_trading_window {
-        handle_market_transition(state, slug.clone(), http, oracle).await?;
+    // ── Market transition (held until the 25-sec window closes) ──────────────
+    let in_window = matches!(state.phase, MarketPhase::JustEnded { .. });
+    if new_slug != state.cached_slug && !in_window {
+        handle_market_transition(state, new_slug, http).await?;
     }
 
     Ok(())
 }
 
-// ── Market transition handler ─────────────────────────────────────────────────
+// ── Market transition ─────────────────────────────────────────────────────────
 
 async fn handle_market_transition(
     state: &mut AppState,
     new_slug: String,
     http: &HttpClient,
-    oracle: &PriceClient,
 ) -> Result<()> {
-    // If we just transitioned out of a market, try to fetch PnL info
     if !state.cached_slug.is_empty() {
         try_finalize_pnl(state, http).await;
         state.phase = MarketPhase::Active;
@@ -264,30 +268,16 @@ async fn handle_market_transition(
         state.post_market_orderbook = None;
     }
 
-    // Resolve new market
     let meta = resolve_market(http, &state.config.slug_prefix, state.config.interval_secs).await?;
 
-    // Fetch the exact beat price from Data Streams at event_start_time.
-    // This matches the price Polymarket uses for resolution.
-    // Falls back to: text-parsed price → current live price.
-    let beat_price = if oracle.has_data_streams() {
-        match oracle.price_at(meta.event_start_time).await {
-            Ok(p) => {
-                state.status_line = format!(
-                    "Beat price from DS at {}: ${:.2}", meta.event_start_time, p
-                );
-                p
-            }
-            Err(e) => {
-                eprintln!("[DS] historical beat price failed: {e}");
-                meta.beat_price.unwrap_or(state.btc_price)
-            }
-        }
-    } else {
-        meta.beat_price.unwrap_or(state.btc_price)
-    };
+    // Use the beat price captured at the exact bucket boundary (even if captured
+    // during the 25-sec window).  Fall back to current price only if not set.
+    let beat_price = state.next_beat_price
+        .take()
+        .filter(|&p| p > 0.0)
+        .unwrap_or(state.btc_price);
 
-    state.beat_price     = if beat_price > 0.0 { beat_price } else { state.btc_price };
+    state.beat_price     = beat_price;
     state.current_market = meta;
     state.cached_slug    = new_slug;
     state.candles        = CandleHistory::new(3);
@@ -301,12 +291,10 @@ async fn handle_market_transition(
 // ── Active market tick ────────────────────────────────────────────────────────
 
 async fn tick_active(state: &mut AppState, http: &HttpClient) -> Result<()> {
-    // Check if market has ended
     if state.current_market.has_ended() {
         let end_price = state.btc_price;
-        let winner = if end_price > state.beat_price { "up" } else { "down" };
+        let winner    = if end_price > state.beat_price { "up" } else { "down" };
 
-        // Snapshot post-market state
         state.post_market_winner     = winner.to_string();
         state.post_market_end_price  = end_price;
         state.post_market_beat_price = state.beat_price;
@@ -320,35 +308,32 @@ async fn tick_active(state: &mut AppState, http: &HttpClient) -> Result<()> {
         };
 
         state.status_line = format!(
-            "Market ENDED! Winner: {}  Beat: ${:.2}  End: ${:.2}  Fetching orderbook...",
-            winner.to_uppercase(),
-            state.beat_price,
-            end_price,
+            "Market ENDED!  Winner: {}  Beat: ${:.2}  End: ${:.2}  Scanning orderbook…",
+            winner.to_uppercase(), state.beat_price, end_price,
         );
         return Ok(());
     }
 
-    // Fetch orderbook for display
+    // Fetch orderbook for live display
     match fetch_orderbook(http, &state.current_market).await {
         Ok(ob) => state.orderbook = ob,
-        Err(e) => eprintln!("[WARN] orderbook fetch failed: {}", e),
+        Err(e) => eprintln!("[WARN] orderbook fetch: {}", e),
     }
 
     let secs_left = state.current_market.seconds_until_end();
-    let direction = if state.btc_price > state.beat_price { "↑ UP" } else { "↓ DOWN" };
     let delta     = state.btc_price - state.beat_price;
     let pct       = if state.beat_price > 0.0 { delta / state.beat_price * 100.0 } else { 0.0 };
+    let dir       = if state.btc_price > state.beat_price { "↑ UP" } else { "↓ DOWN" };
 
     state.status_line = format!(
         "Active  {:02}:{:02} left  BTC ${:.2}  Beat ${:.2}  Δ{:+.2} ({:+.3}%)  {}",
         secs_left / 60, secs_left % 60,
-        state.btc_price, state.beat_price, delta, pct, direction,
+        state.btc_price, state.beat_price, delta, pct, dir,
     );
-
     Ok(())
 }
 
-// ── Just-ended tick: buy winner asks below $1.00, runs every tick during window ─
+// ── Just-ended tick ───────────────────────────────────────────────────────────
 
 async fn tick_just_ended(
     state: &mut AppState,
@@ -358,10 +343,9 @@ async fn tick_just_ended(
     end_price: f64,
     ended_at: i64,
 ) -> Result<()> {
-    let elapsed = Utc::now().timestamp() - ended_at;
+    let elapsed   = Utc::now().timestamp() - ended_at;
     let remaining = (state.config.post_market_secs as i64 - elapsed).max(0);
 
-    // Stop trading if we've hit the per-market cap
     let max = state.config.max_trades_per_market;
     if max > 0 && state.bot_trades.len() >= max {
         state.status_line = format!(
@@ -371,7 +355,7 @@ async fn tick_just_ended(
         return Ok(());
     }
 
-    // Fetch current orderbook for winner side
+    // Refresh orderbook every tick during the window
     let ob = match fetch_orderbook(http, &state.current_market).await {
         Ok(o) => o,
         Err(e) => {
@@ -383,22 +367,24 @@ async fn tick_just_ended(
         }
     };
 
-    let winner_book = if winner == "up" { &ob.up } else { &ob.down };
     let winner_token = if winner == "up" {
         state.current_market.up_token_id.clone()
     } else {
         state.current_market.down_token_id.clone()
     };
 
-    state.post_market_orderbook = Some(ob.clone());
+    let winner_book = if winner == "up" { &ob.up } else { &ob.down };
 
-    // Only buy asks strictly below $1.00 (profitable fills)
-    let tradeable_asks: Vec<_> = winner_book.asks.iter()
-        .filter(|ask| ask.price < 1.0)
+    // Update display orderbook
+    state.post_market_orderbook = Some(ob.clone());
+    state.orderbook = ob.clone();
+
+    let tradeable: Vec<_> = winner_book.asks.iter()
+        .filter(|a| a.price < 1.0)
         .cloned()
         .collect();
 
-    if tradeable_asks.is_empty() {
+    if tradeable.is_empty() {
         state.status_line = format!(
             "Winner: {}  No asks below $1.00  Beat: ${:.2}  End: ${:.2}  Window: {}s",
             winner.to_uppercase(), state.beat_price, end_price, remaining,
@@ -406,20 +392,18 @@ async fn tick_just_ended(
         return Ok(());
     }
 
-    // Walk asks cheapest first, spend up to ORDER_USDC budget this tick
+    // Walk asks cheapest-first, spend up to TRADE_AMOUNT budget per tick
     let budget = state.config.order_usdc;
-    let mut remaining_budget = budget;
-    let mut orders_placed = 0;
+    let mut rem_budget          = budget;
+    let mut orders_placed       = 0usize;
     let mut total_shares_bought = 0.0f64;
     let mut total_usdc_spent    = 0.0f64;
 
-    for ask in &tradeable_asks {
-        if remaining_budget < 1.0 { break; }
+    for ask in &tradeable {
+        if rem_budget < 1.0 { break; }
 
-        let max_shares_at_price = remaining_budget / ask.price;
-        let shares_to_buy = max_shares_at_price.min(ask.size);
-        let cost = shares_to_buy * ask.price;
-
+        let shares_to_buy = (rem_budget / ask.price).min(ask.size);
+        let cost          = shares_to_buy * ask.price;
         if cost < 1.0 { break; }
 
         let params = BuyParams {
@@ -431,47 +415,41 @@ async fn tick_just_ended(
         };
 
         match executor.execute_buy(&params).await {
-            Ok(result) => {
+            Ok(res) => {
                 let trade = BotTrade {
                     ts:          Utc::now(),
                     market_slug: state.current_market.slug.clone(),
                     outcome:     winner.to_string(),
-                    shares:      result.shares,
-                    usdc_spent:  result.usdc,
-                    fill_price:  result.fill_price,
-                    order_id:    result.order_id.clone(),
+                    shares:      res.shares,
+                    usdc_spent:  res.usdc,
+                    fill_price:  res.fill_price,
+                    order_id:    res.order_id.clone(),
                     is_live:     executor.is_live(),
                 };
-
                 if let Err(e) = csv_log::append_trade(&trade) {
                     eprintln!("[CSV] write error: {}", e);
                 }
-
-                remaining_budget    -= result.usdc;
-                total_shares_bought += result.shares;
-                total_usdc_spent    += result.usdc;
+                rem_budget          -= res.usdc;
+                total_shares_bought += res.shares;
+                total_usdc_spent    += res.usdc;
                 orders_placed       += 1;
-
                 state.bot_trades.push(trade.clone());
                 state.all_trades.push(trade);
                 state.post_market_trades = state.bot_trades.clone();
             }
-            Err(e) => {
-                eprintln!("[ORDER] execute_buy failed: {}", e);
-            }
+            Err(e) => eprintln!("[ORDER] execute_buy failed: {}", e),
         }
     }
 
     state.status_line = if orders_placed > 0 {
         format!(
-            "Winner: {}  Bought {:.3} shares for ${:.2} in {} order(s)  Beat: ${:.2}  End: ${:.2}  Window: {}s",
-            winner.to_uppercase(),
-            total_shares_bought, total_usdc_spent, orders_placed,
+            "Winner: {}  Bought {:.3} shares for ${:.2} ({} order(s))  Beat: ${:.2}  End: ${:.2}  Window: {}s",
+            winner.to_uppercase(), total_shares_bought, total_usdc_spent, orders_placed,
             state.beat_price, end_price, remaining,
         )
     } else {
         format!(
-            "Winner: {}  Asks present but none filled (below $1 min)  Beat: ${:.2}  End: ${:.2}  Window: {}s",
+            "Winner: {}  Asks present but below $1 min order  Beat: ${:.2}  End: ${:.2}  Window: {}s",
             winner.to_uppercase(), state.beat_price, end_price, remaining,
         )
     };
@@ -484,19 +462,18 @@ async fn tick_just_ended(
 async fn try_finalize_pnl(state: &mut AppState, http: &HttpClient) {
     if state.bot_trades.is_empty() { return; }
 
-    let slug = state.current_market.slug.clone();
+    let slug   = state.current_market.slug.clone();
     let winner = match fetch_market_resolution(http, &slug).await {
         Ok(Some(w)) => w,
-        _ => state.post_market_winner.clone(),
+        _            => state.post_market_winner.clone(),
     };
 
     for trade in &state.bot_trades {
         let pnl = if trade.outcome == winner {
-            trade.shares * 1.0 - trade.usdc_spent
+            trade.shares - trade.usdc_spent
         } else {
             -trade.usdc_spent
         };
-
         if let Err(e) = csv_log::append_pnl_row(
             &slug,
             state.post_market_beat_price,

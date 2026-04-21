@@ -1,24 +1,112 @@
 # poly-last-new
 
-A high-performance Polymarket last-minute trading bot written in Rust. Monitors short-duration BTC/ETH price prediction markets (5-minute and 15-minute intervals), identifies the winner at market expiration using Chainlink oracle prices, and immediately buys the winning outcome shares before prices settle.
+A Polymarket last-minute trading bot written in Rust. Monitors short-duration BTC/ETH price prediction markets (5-minute and 15-minute intervals), determines the winner at market expiration using a live Binance price stream, and immediately buys winning-outcome shares during a 25-second post-market window.
 
 ## Strategy
 
-At market expiration, the bot compares the current BTC/ETH price to the "beat price" (the price when the market opened) via Chainlink oracles on Polygon. It then buys the winning outcome (UP or DOWN) at ask prices within milliseconds of the result being known.
+When a market ends, the bot compares the **end price** (current Binance price) to the **beat price** (the Binance price captured at the exact moment the market's bucket timestamp started). If the end price is higher, UP wins; otherwise DOWN wins. The bot then scans the winner-side orderbook for asks below $1.00 and buys them — these shares resolve to $1.00, yielding profit.
+
+The beat price is captured at the precise second the new market bucket starts, **even if the previous market's 25-second trading window is still open**. This ensures the beat price always matches the true market starting price.
 
 ## Features
 
-- **Two execution modes**: paper trading (test) and live trading (real)
-- **Chainlink oracle** price feeds with Binance REST API fallback
-- **Polymarket CLOB** orderbook integration (builder API + standard API)
-- **Real-time terminal UI** showing candles, orderbook, trades, and P&L
-- **CSV trade logs** per market and aggregated P&L summary
-- **State machine** managing full market lifecycle (active → ended → transitioning)
+- **Binance live price stream** — polls `api.binance.com` every 250 ms, no API key required
+- **Accurate beat price** — captured at the bucket boundary timestamp, not at transition time
+- **25-second post-market window** — scans and trades winner-side asks after market ends
+- **Two execution modes** — paper trading (test) and live trading (real)
+- **Real-time terminal UI** — beat price, current price, difference, 5 ask levels for UP and DOWN
+- **Per-market CSV trade logs** in `data/` folder
+- **PnL calculator binary** — `cargo run --bin pnl` sums actual profit/loss from all CSV files
 
-## Prerequisites
+## Environment Setup
 
-- [Rust toolchain](https://rustup.rs/) (edition 2021, stable)
-- Network access to Polymarket APIs and a Polygon RPC endpoint
+### 1. Install Rust
+
+If Rust is not already installed, use `rustup` (the official installer):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Follow the on-screen prompts (the default installation is fine). Then activate the toolchain in your current shell:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+Verify the installation:
+
+```bash
+rustc --version   # e.g. rustc 1.78.0
+cargo --version   # e.g. cargo 1.78.0
+```
+
+The project requires **stable Rust** (edition 2021). To update an existing installation:
+
+```bash
+rustup update stable
+```
+
+### 2. System Dependencies
+
+The project uses `rustls` with the AWS-LC crypto provider, which is bundled and requires no extra system libraries. No OpenSSL or Polygon RPC credentials are needed.
+
+On **Ubuntu / Debian** you may need the C build toolchain if it is not present:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config
+```
+
+On **macOS** the Xcode command-line tools cover this:
+
+```bash
+xcode-select --install
+```
+
+### 3. Clone and Build
+
+```bash
+git clone <repo>
+cd poly-last-new
+cargo build --release
+```
+
+Compiled binaries will be placed in `target/release/`.
+
+### 4. Create Your `.env` File
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and set at minimum:
+
+```env
+MARKET=btc-5m          # btc-5m | btc-15m | eth-5m | eth-15m
+TRADE_AMOUNT=10.0      # USDC to spend per trade
+MAX_TRADES=3           # max orders per post-market window (0 = unlimited)
+SLIPPAGE_BUFFER=0.02   # price buffer added to ask price
+```
+
+For **live trading** also add your Polymarket credentials:
+
+```env
+POLYMARKET_PRIVATE_KEY=0x...
+POLYMARKET_BUILDER_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+POLYMARKET_BUILDER_SECRET=...
+POLYMARKET_BUILDER_PASSPHRASE=...
+```
+
+### 5. Verify Setup (paper mode)
+
+Run the paper-trading bot to confirm everything connects correctly:
+
+```bash
+cargo run --bin bot_test
+```
+
+You should see the terminal UI appear with live BTC/ETH price data within a few seconds.
 
 ## Installation
 
@@ -28,26 +116,20 @@ cd poly-last-new
 cargo build --release
 ```
 
-## Configuration
-
-Copy the example environment file and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
 ### Environment Variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `MARKET` | No | `btc-5m` | Market to trade: `btc-5m`, `btc-15m`, `eth-5m`, `eth-15m` |
-| `ORDER_USDC` | No | `10.0` | USDC budget per trade after winner is confirmed |
-| `SLIPPAGE_BUFFER` | No | `0.02` | Price slippage buffer added to ask (e.g. `0.02` = 2%) |
-| `POLYGON_RPC_URL` | No | `https://polygon-rpc.com` | Polygon RPC endpoint for Chainlink oracle calls |
-| `POLYMARKET_PRIVATE_KEY` | Live only | — | Wallet private key (`0x...`) for signing orders |
+| `TRADE_AMOUNT` | No | `10.0` | USDC to spend per trade after winner is confirmed |
+| `MAX_TRADES` | No | `0` | Max orders per market (0 = unlimited) |
+| `SLIPPAGE_BUFFER` | No | `0.02` | Price buffer added to ask when placing orders (e.g. `0.02` = 2 cents) |
+| `POLYMARKET_PRIVATE_KEY` | Live only | — | Wallet private key (`0x…`) for signing orders |
 | `POLYMARKET_BUILDER_KEY` | Optional | — | Builder API key (UUID) — falls back to standard API if absent |
 | `POLYMARKET_BUILDER_SECRET` | Optional | — | Builder API secret |
 | `POLYMARKET_BUILDER_PASSPHRASE` | Optional | — | Builder API passphrase |
+
+> `ORDER_USDC` and `MAX_TRADES_PER_MARKET` are accepted as backward-compatible aliases for `TRADE_AMOUNT` and `MAX_TRADES`.
 
 ## Usage
 
@@ -57,7 +139,7 @@ cp .env.example .env
 cargo run --bin bot_test
 ```
 
-Simulates fills at ask prices. Safe to run without any credentials. Ideal for testing strategy and validating the setup.
+Simulates fills at ask prices with no credentials required. Good for verifying strategy and configuration.
 
 ### Live Trading (real USDC orders)
 
@@ -65,22 +147,54 @@ Simulates fills at ask prices. Safe to run without any credentials. Ideal for te
 cargo run --bin bot_real
 ```
 
-Places real orders on the Polymarket CLOB. The bot waits 3 seconds on startup — press `Ctrl+C` to abort before trading begins.
+Places real FOK limit orders on the Polymarket CLOB. Waits 3 seconds on startup — press `Ctrl+C` to abort.
 
 **Requirements for live mode:**
 - `POLYMARKET_PRIVATE_KEY` set in `.env`
-- Sufficient USDC balance in the configured wallet on Polygon
+- Sufficient USDC in the configured wallet on Polygon
+
+### PnL Calculator
+
+```bash
+cargo run --bin pnl
+```
+
+Reads `data/pnl_summary.csv` and prints a per-market breakdown with total PnL, win rate, and ROI.
 
 ### Production Build
 
 ```bash
 cargo build --release
-# Binaries at:
-#   target/release/bot_test
-#   target/release/bot_real
+# target/release/bot_test
+# target/release/bot_real
+# target/release/pnl
 ```
 
-The release profile enables LTO, O3 optimization, and binary stripping for minimal latency.
+## Terminal Display
+
+During operation the terminal shows:
+
+```
+  ──── BTC Price vs Beat Price ──────────────────────────────
+  Beat price   :      $83,450.00
+  Current price:      $83,525.00
+  Difference   :  +$75.00  (+0.090%)  →  UP ↑
+
+  ──── Orderbook — 5 Ask Levels ─────────────────────────────
+  UP   asks — 5 level(s)
+    Price      Size     Value$       Cum$
+    0.8500   120.000    $102.00    $102.00
+    0.8600    85.000     $73.10    $175.10
+    ...
+
+  DOWN asks — 5 level(s)
+    ...
+
+  ▶ POST-MARKET WINDOW — 18s remaining
+  ══ MARKET ENDED  Winner: UP  Beat: $83,450.00  End: $83,525.00 ══
+  Winner (UP) asks below $1.00 — 3 level(s)
+    ...
+```
 
 ## Project Structure
 
@@ -89,19 +203,20 @@ poly-last-new/
 ├── Cargo.toml
 ├── .env.example
 ├── data/                       # Auto-created; CSV logs written here
-│   ├── <slug>_trades.csv
-│   └── pnl_summary.csv
+│   ├── <slug>_trades.csv       # One file per market
+│   └── pnl_summary.csv         # Aggregated PnL across all markets
 └── src/
     ├── bin/
     │   ├── bot_test.rs         # Paper trading entry point
-    │   └── bot_real.rs         # Live trading entry point
+    │   ├── bot_real.rs         # Live trading entry point
+    │   └── pnl.rs              # Standalone PnL calculator
     ├── api.rs                  # Polymarket Gamma + CLOB API calls
-    ├── chainlink.rs            # Chainlink oracle price fetching
+    ├── binance.rs              # Binance price stream (250 ms polling)
     ├── config.rs               # .env configuration loading
     ├── display.rs              # Terminal UI rendering
     ├── engine.rs               # Main trading loop & state machine
     ├── executor.rs             # Order execution (test vs. live)
-    ├── csv_log.rs              # Trade and P&L CSV logging
+    ├── csv_log.rs              # Trade and PnL CSV logging
     ├── types.rs                # Core data structures
     └── lib.rs                  # Module exports
 ```
@@ -110,69 +225,68 @@ poly-last-new/
 
 All logs are written to the `data/` directory (created automatically).
 
-**Per-market trade log** (`data/<slug>_trades.csv`):
+### Per-market trade log — `data/<slug>_trades.csv`
 
 | Column | Description |
 |---|---|
 | `executed_at` | UTC timestamp of execution |
-| `market_slug` | Market identifier |
+| `market_slug` | Market identifier (e.g. `btc-updown-5m-1776795300`) |
 | `outcome` | `UP` or `DOWN` |
 | `shares` | Shares purchased |
 | `usdc_spent` | USDC amount used |
-| `fill_price` | Average fill price |
-| `order_id` | Order/paper trade ID |
-| `is_live` | `true` for live orders, `false` for paper |
+| `fill_price` | Fill price per share |
+| `order_id` | On-chain order ID or paper trade UUID |
+| `is_live` | `true` for real orders, `false` for paper |
 
-**P&L summary** (`data/pnl_summary.csv`):
+### PnL summary — `data/pnl_summary.csv`
 
 | Column | Description |
 |---|---|
-| `market_slug` | Market identifier |
-| `beat_price` | Reference price at market open |
-| `end_price` | Chainlink price at expiration |
-| `winner` | Correct outcome |
-| `our_outcome` | Outcome purchased |
-| `shares_bought` | Total shares |
-| `usdc_spent` | Total USDC spent |
-| `pnl_usd` | Profit/loss in USD |
-| `pnl_percentage` | Profit/loss as percentage |
-| `resolved` | Whether market resolved |
-| `executed_at` | Timestamp |
+| `slug` | Market identifier |
+| `beat_price` | Binance price at market bucket start |
+| `end_price` | Binance price at market expiration |
+| `winner` | Correct outcome (`up` / `down`) |
+| `our_outcome` | Outcome we purchased |
+| `shares` | Shares bought |
+| `usdc_spent` | USDC spent |
+| `fill_price` | Average fill price |
+| `pnl` | Profit/loss: `shares − usdc_spent` (win) or `−usdc_spent` (loss) |
+| `resolved` | Whether Polymarket confirmed the winner on-chain |
+| `executed_at` | Trade timestamp |
 | `order_id` | Associated order ID |
 
 ## Supported Markets
 
-| Slug | Asset | Duration | Chainlink Feed |
-|---|---|---|---|
-| `btc-5m` | BTC/USD | 5 minutes | `0xc907E116054Ad103354f2D350FD2514433D57F6f` |
-| `btc-15m` | BTC/USD | 15 minutes | `0xc907E116054Ad103354f2D350FD2514433D57F6f` |
-| `eth-5m` | ETH/USD | 5 minutes | `0xF9680D99D6C9589e2a93a78A04A279e509205945` |
-| `eth-15m` | ETH/USD | 15 minutes | `0xF9680D99D6C9589e2a93a78A04A279e509205945` |
+| Market key | Asset | Duration |
+|---|---|---|
+| `btc-5m` | BTC/USD | 5 minutes |
+| `btc-15m` | BTC/USD | 15 minutes |
+| `eth-5m` | ETH/USD | 5 minutes |
+| `eth-15m` | ETH/USD | 15 minutes |
 
-All feeds are on Polygon mainnet with 8 decimal precision.
+Market slugs follow the format `{asset}-updown-{interval}-{unix_timestamp}`, e.g. `btc-updown-5m-1776795300`. The timestamp in the slug is the bucket start time — this is exactly the moment the beat price is captured.
 
 ## External APIs
 
 | Service | Purpose |
 |---|---|
-| Polymarket Gamma API | Market metadata, token IDs, resolution |
-| Polymarket CLOB API | Orderbook queries, order placement |
-| Chainlink (Polygon) | Authoritative price at market end |
-| Binance REST API | Price fallback if Chainlink RPC fails |
+| Binance public REST | Live BTC/ETH price stream (no key required) |
+| Polymarket Gamma API | Market metadata, token IDs, on-chain resolution |
+| Polymarket CLOB API | Orderbook snapshots, order placement |
 
 ## Operational Notes
 
-- **Latency**: The bot polls orderbooks every ~500ms. For production use, a private Polygon RPC (`POLYGON_RPC_URL`) is strongly recommended over the public default.
-- **Wallet funding**: Live mode requires USDC in the wallet on Polygon. Ensure sufficient balance before running.
-- **Continuous operation**: The bot runs 24/7, cycling through markets automatically. It only executes orders at market expiration.
-- **Resource usage**: Single-threaded async (Tokio); minimal CPU and memory footprint.
-- **Order constraints**: Minimum order size is $1 USDC; minimum lot size is 0.01 shares. Orders below these thresholds are skipped.
+- **Beat price timing**: Captured at the exact bucket boundary, even during the previous market's 25-second window. The bot does not wait for the transition to record it.
+- **Post-market window**: 25 seconds after market end. The orderbook is refreshed every 200 ms during this window. Trading stops when either time runs out, budget is exhausted, or `MAX_TRADES` is reached.
+- **Order type**: FOK (fill-or-kill) — fills immediately at the submitted price or is rejected. No resting orders.
+- **Minimum order**: $1.00 USDC; minimum lot size 0.01 shares. Orders below these thresholds are skipped.
+- **Wallet funding**: Live mode requires USDC in the Polygon wallet. Use a dedicated wallet with only the USDC needed for trading.
 
 ## Security
 
 - Never commit your `.env` file or expose `POLYMARKET_PRIVATE_KEY`.
-- Use a dedicated wallet with only the USDC needed for trading — do not use a primary wallet.
-- Review `executor.rs` and `config.rs` before running in live mode to understand how credentials are used.
+- Use a dedicated wallet — do not use a primary wallet.
+- Review `executor.rs` and `config.rs` before running in live mode.
 
 ## License
 
