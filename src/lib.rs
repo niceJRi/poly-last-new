@@ -1,5 +1,5 @@
 pub mod api;
-pub mod binance;
+pub mod price;
 pub mod config;
 pub mod csv_log;
 pub mod display;

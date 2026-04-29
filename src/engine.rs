@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use crate::api::{current_bucket_ts, fetch_market_resolution, fetch_orderbook, resolve_market};
-use crate::binance::{fetch_price_rest, start_price_stream, SharedPrice};
+use crate::price::{start_price_stream, SharedPrice};
 use crate::config::Config;
 use crate::csv_log;
 use crate::display::render;
@@ -25,7 +25,7 @@ pub struct AppState {
     pub cached_slug: String,
 
     pub btc_price: f64,
-    pub beat_price: f64,  // Binance price captured at the moment the market bucket started
+    pub beat_price: f64,  // RTDS price captured at the moment the market bucket started
     pub candles: CandleHistory,
 
     pub orderbook: Orderbook,
@@ -38,10 +38,11 @@ pub struct AppState {
     pub last_tick_ms: u64,
     pub status_line: String,
 
-    // Beat price pre-captured when the next market bucket is first detected.
-    // This is set even while the 25-sec post-market window is still running,
-    // so the new market starts with the price from exactly its bucket boundary.
+    // Price captured at the exact bucket boundary second — becomes the next market's beat price.
     pub next_beat_price: Option<f64>,
+
+    // Last bucket timestamp seen — used to detect boundary crossings (0 = first run / startup).
+    pub last_seen_bucket_ts: i64,
 
     // After-market snapshot for display during the 25-sec window
     pub post_market_orderbook: Option<Orderbook>,
@@ -68,8 +69,9 @@ impl AppState {
             all_trades: Vec::new(),
             poll_count: 0,
             last_tick_ms: 0,
-            status_line: "Initializing… connecting to Binance".to_string(),
+            status_line: "Initializing… connecting to Polymarket RTDS".to_string(),
             next_beat_price: None,
+            last_seen_bucket_ts: 0,
             post_market_orderbook: None,
             post_market_winner: String::new(),
             post_market_end_price: 0.0,
@@ -141,19 +143,7 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    // Grab initial price via REST while the poll loop warms up
-    match fetch_price_rest(&http, &state.config.asset).await {
-        Ok(p) => {
-            state.btc_price = p;
-            state.candles.update(p);
-            state.status_line = format!(
-                "Binance initial price: ${:.2} — starting stream…", p
-            );
-        }
-        Err(e) => eprintln!("[Binance] initial REST fetch failed: {e}"),
-    }
-
-    // Start background 250 ms poll loop (updates SharedPrice in real-time)
+    // Start background Polymarket RTDS WebSocket (updates SharedPrice in real-time)
     let price_stream: SharedPrice = start_price_stream(http.clone(), &state.config.asset);
 
     // Render task — redraws terminal every 500 ms
@@ -173,17 +163,41 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
         state.poll_count += 1;
         let t0 = Instant::now();
 
-        // Pull latest Binance price from shared stream
+        let current_bucket = current_bucket_ts(state.config.interval_secs);
+        if current_bucket > state.last_seen_bucket_ts {
+            state.last_seen_bucket_ts = current_bucket;
+            state.next_beat_price = None; // discard stale boundary value; look fresh for this second
+        }
+
         {
-            let p = *price_stream.lock().await;
+            let history = price_stream.lock().await;
+            let p = history.current_price();
             if p > 0.0 {
                 state.btc_price = p;
                 state.candles.update(p);
+            }
+            // Match on Chainlink oracle timestamp exactly — same logic as the JS RTDS recorder.
+            // Polled every 200ms until the oracle delivers the round whose chainlink_ts ==
+            // the boundary second (e.g. 01:30:00).  No wall-clock fudge needed.
+            if state.next_beat_price.is_none() && state.last_seen_bucket_ts > 0 {
+                if let Some(bp) = history.price_exact(state.last_seen_bucket_ts) {
+                    state.next_beat_price = Some(bp);
+                }
             }
         }
 
         if let Err(e) = tick(&mut state, &http, &executor).await {
             state.status_line = format!("Error: {}", e);
+        }
+
+        // Startup catch: bot started mid-market so no boundary crossing was seen.
+        // Once RTDS delivers a valid price, use it as the beat price immediately.
+        // Fires exactly once (beat_price stays > 0 afterwards).
+        if state.beat_price == 0.0
+            && state.btc_price > 0.0
+            && !state.current_market.is_empty()
+        {
+            state.beat_price = state.btc_price;
         }
 
         state.last_tick_ms = t0.elapsed().as_millis() as u64;
@@ -206,22 +220,6 @@ async fn tick(
 ) -> Result<()> {
     let cfg = &state.config;
     let new_slug = format!("{}-{}", cfg.slug_prefix, current_bucket_ts(cfg.interval_secs));
-
-    // ── Beat-price capture: runs even during the 25-sec window ────────────────
-    // The slug for the NEXT market becomes valid at the exact bucket boundary.
-    // We snapshot the Binance price at that moment so the new market's
-    // "price to beat" is the true starting price, not the post-window price.
-    if !new_slug.is_empty()
-        && new_slug != state.cached_slug
-        && !state.cached_slug.is_empty()
-        && state.next_beat_price.is_none()
-    {
-        state.next_beat_price = Some(state.btc_price);
-        eprintln!(
-            "[Engine] Saved next beat price ${:.2} for {}",
-            state.btc_price, new_slug
-        );
-    }
 
     // ── Phase state machine ───────────────────────────────────────────────────
     match state.phase.clone() {
@@ -270,12 +268,12 @@ async fn handle_market_transition(
 
     let meta = resolve_market(http, &state.config.slug_prefix, state.config.interval_secs).await?;
 
-    // Use the beat price captured at the exact bucket boundary (even if captured
-    // during the 25-sec window).  Fall back to current price only if not set.
+    // Beat price comes from the RTDS snapshot taken at the prior market's end.
+    // 0.0 means unknown (bot started mid-market; display shows "-", no trading).
     let beat_price = state.next_beat_price
         .take()
         .filter(|&p| p > 0.0)
-        .unwrap_or(state.btc_price);
+        .unwrap_or(0.0);
 
     state.beat_price     = beat_price;
     state.current_market = meta;
@@ -291,9 +289,19 @@ async fn handle_market_transition(
 // ── Active market tick ────────────────────────────────────────────────────────
 
 async fn tick_active(state: &mut AppState, http: &HttpClient) -> Result<()> {
-    if state.current_market.has_ended() {
-        let end_price = state.btc_price;
-        let winner    = if end_price > state.beat_price { "up" } else { "down" };
+    // Detect market end using the bucket clock — accurate to the second.
+    // `end_time` from the Gamma API is sometimes 1s past the true boundary,
+    // so `has_ended()` would fire one second late and read the wrong RTDS price.
+    let cur_bucket = current_bucket_ts(state.config.interval_secs);
+    let market_ended = state.current_market.event_start_time > 0
+        && cur_bucket > state.current_market.event_start_time;
+
+    if market_ended {
+        // end_price = live price at the :00:00 boundary tick (same value that
+        // becomes the next market's beat price).  Peek without consuming so
+        // handle_market_transition can still use it as beat_price.
+        let end_price = state.next_beat_price.unwrap_or(state.btc_price);
+        let winner = if state.beat_price > 0.0 && end_price > state.beat_price { "up" } else { "down" };
 
         state.post_market_winner     = winner.to_string();
         state.post_market_end_price  = end_price;
@@ -321,15 +329,22 @@ async fn tick_active(state: &mut AppState, http: &HttpClient) -> Result<()> {
     }
 
     let secs_left = state.current_market.seconds_until_end();
-    let delta     = state.btc_price - state.beat_price;
-    let pct       = if state.beat_price > 0.0 { delta / state.beat_price * 100.0 } else { 0.0 };
-    let dir       = if state.btc_price > state.beat_price { "↑ UP" } else { "↓ DOWN" };
 
-    state.status_line = format!(
-        "Active  {:02}:{:02} left  BTC ${:.2}  Beat ${:.2}  Δ{:+.2} ({:+.3}%)  {}",
-        secs_left / 60, secs_left % 60,
-        state.btc_price, state.beat_price, delta, pct, dir,
-    );
+    state.status_line = if state.beat_price > 0.0 {
+        let delta = state.btc_price - state.beat_price;
+        let pct   = delta / state.beat_price * 100.0;
+        let dir   = if state.btc_price > state.beat_price { "↑ UP" } else { "↓ DOWN" };
+        format!(
+            "Active  {:02}:{:02} left  BTC ${:.2}  Beat ${:.2}  Δ{:+.2} ({:+.3}%)  {}",
+            secs_left / 60, secs_left % 60,
+            state.btc_price, state.beat_price, delta, pct, dir,
+        )
+    } else {
+        format!(
+            "Active  {:02}:{:02} left  BTC ${:.2}  Beat: N/A (started mid-market)",
+            secs_left / 60, secs_left % 60, state.btc_price,
+        )
+    };
     Ok(())
 }
 
@@ -345,6 +360,15 @@ async fn tick_just_ended(
 ) -> Result<()> {
     let elapsed   = Utc::now().timestamp() - ended_at;
     let remaining = (state.config.post_market_secs as i64 - elapsed).max(0);
+
+    // If the bot started mid-market we never had a valid beat price for this
+    // market, so skip trading and just wait for the next market.
+    if state.beat_price == 0.0 {
+        state.status_line = format!(
+            "Skipping — beat price unknown (started mid-market)  Window: {}s", remaining,
+        );
+        return Ok(());
+    }
 
     let max = state.config.max_trades_per_market;
     if max > 0 && state.bot_trades.len() >= max {
