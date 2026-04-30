@@ -182,6 +182,16 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
             if state.next_beat_price.is_none() && state.last_seen_bucket_ts > 0 {
                 if let Some(bp) = history.price_exact(state.last_seen_bucket_ts) {
                     state.next_beat_price = Some(bp);
+                    // If the market just ended before the oracle delivered this round,
+                    // patch post_market_end_price and recalculate the winner now.
+                    if matches!(state.phase, MarketPhase::JustEnded { .. }) {
+                        state.post_market_end_price = bp;
+                        if state.post_market_beat_price > 0.0 {
+                            state.post_market_winner =
+                                if bp > state.post_market_beat_price { "up" } else { "down" }
+                                .to_string();
+                        }
+                    }
                 }
             }
         }
@@ -227,14 +237,17 @@ async fn tick(
             tick_active(state, http).await?;
         }
 
-        MarketPhase::JustEnded { ended_at, winner, end_btc_price } => {
+        MarketPhase::JustEnded { ended_at, winner, .. } => {
             let elapsed = Utc::now().timestamp() - ended_at;
             if elapsed >= state.config.post_market_secs as i64 {
                 state.phase = MarketPhase::Transitioning;
                 state.status_line = "Post-market window closed, loading next market…".to_string();
             } else {
                 let w = winner.clone();
-                tick_just_ended(state, http, executor, &w, end_btc_price, ended_at).await?;
+                // Use post_market_end_price which may have been patched once the
+                // oracle delivered the boundary-second Chainlink round.
+                let end_p = state.post_market_end_price;
+                tick_just_ended(state, http, executor, &w, end_p, ended_at).await?;
             }
         }
 
@@ -298,6 +311,7 @@ async fn tick_active(state: &mut AppState, http: &HttpClient) -> Result<()> {
 
     if market_ended {
         let end_price = state.next_beat_price.unwrap_or(state.btc_price);
+        eprintln!("[WINNER] beat={:.2} end={:.2}", state.beat_price, end_price);
         let winner = if state.beat_price > 0.0 && end_price > state.beat_price { "up" } else { "down" };
 
         state.post_market_winner     = winner.to_string();

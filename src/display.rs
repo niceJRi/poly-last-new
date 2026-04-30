@@ -123,10 +123,15 @@ pub fn render(s: &RenderState) {
     render_ask_table(&mut buf, "DOWN asks", &ob_to_show.down, RED);
 
     // ── Post-market window ────────────────────────────────────────────────────
-    if let MarketPhase::JustEnded { ended_at, winner, end_btc_price } = &s.phase {
+    if let MarketPhase::JustEnded { ended_at, .. } = &s.phase {
         let elapsed   = Utc::now().timestamp() - ended_at;
         let remaining = (s.config.post_market_secs as i64 - elapsed).max(0);
-        let win_color = if *winner == "up" { GREEN } else { RED };
+        // Use post_market_winner / post_market_end_price from state — these are
+        // patched once the oracle delivers the exact boundary-second Chainlink round,
+        // unlike the stale values stored inside the JustEnded enum at capture time.
+        let winner    = &s.post_market_winner;
+        let end_price = s.post_market_end_price;
+        let win_color = if winner == "up" { GREEN } else { RED };
 
         wl(&mut buf, "");
         if remaining > 0 {
@@ -138,12 +143,12 @@ pub fn render(s: &RenderState) {
 
         wl(&mut buf, &format!("  {}{}══ MARKET ENDED  Winner: {}{}{}  Beat: ${:.2}  End: ${:.2} ══{}{}",
             BOLD, win_color, winner.to_uppercase(), RESET, BOLD,
-            s.post_market_beat_price, end_btc_price,
+            s.post_market_beat_price, end_price,
             win_color, RESET,
         ));
 
         if let Some(ob) = &s.post_market_orderbook {
-            let winner_book = if *winner == "up" { &ob.up } else { &ob.down };
+            let winner_book = if winner == "up" { &ob.up } else { &ob.down };
             let below: Vec<&OrderLevel> = winner_book.asks.iter()
                 .filter(|a| a.price < 1.0)
                 .collect();
