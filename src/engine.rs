@@ -297,9 +297,6 @@ async fn tick_active(state: &mut AppState, http: &HttpClient) -> Result<()> {
         && cur_bucket > state.current_market.event_start_time;
 
     if market_ended {
-        // end_price = live price at the :00:00 boundary tick (same value that
-        // becomes the next market's beat price).  Peek without consuming so
-        // handle_market_transition can still use it as beat_price.
         let end_price = state.next_beat_price.unwrap_or(state.btc_price);
         let winner = if state.beat_price > 0.0 && end_price > state.beat_price { "up" } else { "down" };
 

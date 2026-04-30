@@ -30,7 +30,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util      = "0.3"
 uuid              = { version = "1", features = ["v4"] }
 
-polymarket-client-sdk = { version = "0.4.4", features = ["clob", "gamma", "data"] }
+polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "gamma", "data"] }
 alloy   = { version = "1.7.3", features = ["sol-types", "contract", "providers", "network", "transport-http", "signer-local", "signers", "rpc-types"] }
 rustls  = { version = "0.23", features = ["aws_lc_rs"] }
 

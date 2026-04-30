@@ -14,9 +14,7 @@ pub struct Config {
     pub max_trades_per_market: usize, // 0 = unlimited (MAX_TRADES in .env)
     // real-mode credentials
     pub private_key: Option<String>,
-    pub builder_api_key: Option<String>,
-    pub builder_secret: Option<String>,
-    pub builder_passphrase: Option<String>,
+    pub builder_code: Option<String>,  // 32-byte hex builder attribution code (CLOB V2)
 }
 
 impl Config {
@@ -64,14 +62,12 @@ impl Config {
             .parse()
             .context("MAX_TRADES must be a whole number")?;
 
-        let (pk, bkey, bsec, bpass) = if require_credentials {
-            let pk    = env::var("POLYMARKET_PRIVATE_KEY").context("POLYMARKET_PRIVATE_KEY not set")?;
-            let bkey  = env::var("POLYMARKET_BUILDER_KEY").context("POLYMARKET_BUILDER_KEY not set")?;
-            let bsec  = env::var("POLYMARKET_BUILDER_SECRET").context("POLYMARKET_BUILDER_SECRET not set")?;
-            let bpass = env::var("POLYMARKET_BUILDER_PASSPHRASE").context("POLYMARKET_BUILDER_PASSPHRASE not set")?;
-            (Some(pk), Some(bkey), Some(bsec), Some(bpass))
+        let (pk, builder_code) = if require_credentials {
+            let pk   = env::var("POLYMARKET_PRIVATE_KEY").context("POLYMARKET_PRIVATE_KEY not set")?;
+            let code = env::var("POLYMARKET_BUILDER_CODE").ok(); // optional
+            (Some(pk), code)
         } else {
-            (None, None, None, None)
+            (None, None)
         };
 
         Ok(Config {
@@ -81,13 +77,11 @@ impl Config {
             asset: asset.to_string(),
             order_usdc,
             slippage_buffer,
-            poll_ms: 200,           // poll Polymarket orderbook every 200 ms
-            post_market_secs: 25,   // 25-second post-market trading window
+            poll_ms: 200,
+            post_market_secs: 25,
             max_trades_per_market: max_trades,
             private_key: pk,
-            builder_api_key: bkey,
-            builder_secret: bsec,
-            builder_passphrase: bpass,
+            builder_code,
         })
     }
 }

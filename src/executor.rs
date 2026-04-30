@@ -38,30 +38,23 @@ impl Executor for TestExecutor {
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alloy::primitives::U256;
-use alloy::signers::local::PrivateKeySigner;
+use alloy::primitives::{B256, U256};
 use alloy::signers::Signer as _;
+use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use rust_decimal::Decimal;
 
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::{self, Credentials, Normal};
-use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType};
-use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
+use polymarket_client_sdk_v2::POLYGON;
 
 use crate::config::Config;
 
-type NormalClient  = Client<Authenticated<Normal>>;
-type BuilderClient = Client<Authenticated<auth::builder::Builder>>;
-
-enum Inner {
-    Builder(Arc<(BuilderClient, PrivateKeySigner)>),
-    Normal(Arc<(NormalClient, PrivateKeySigner)>),
-}
-
 pub struct RealExecutor {
-    inner: Inner,
+    client:  Arc<Client<Authenticated<Normal>>>,
+    signer:  Arc<PrivateKeySigner>,
     slippage_buffer: f64,
 }
 
@@ -74,38 +67,25 @@ impl RealExecutor {
             .context("Failed to parse private key")?
             .with_chain_id(Some(POLYGON));
 
-        let normal_client = Client::new(
-            "https://clob.polymarket.com",
-            ClobConfig::builder().use_server_time(true).build(),
-        )?
-        .authentication_builder(&signer)
-        .signature_type(SignatureType::GnosisSafe)
-        .authenticate()
-        .await
-        .context("CLOB authentication failed")?;
+        // Builder code is an optional 32-byte hex string for trade attribution.
+        let clob_config = if let Some(code_hex) = cfg.builder_code.as_deref() {
+            let code = B256::from_str(code_hex)
+                .context("POLYMARKET_BUILDER_CODE must be a 0x-prefixed 32-byte hex string")?;
+            ClobConfig::builder().builder_code(code).build()
+        } else {
+            ClobConfig::default()
+        };
 
-        if let (Some(bkey), Some(bsec), Some(bpass)) = (
-            cfg.builder_api_key.as_deref(),
-            cfg.builder_secret.as_deref(),
-            cfg.builder_passphrase.as_deref(),
-        ) {
-            let key_uuid = Uuid::parse_str(bkey)
-                .context("POLYMARKET_BUILDER_KEY must be a valid UUID")?;
-            let builder_creds = Credentials::new(key_uuid, bsec.to_string(), bpass.to_string());
-            let builder_cfg = auth::builder::Config::local(builder_creds);
-            let builder_client = normal_client
-                .promote_to_builder(builder_cfg)
-                .await
-                .context("Failed to promote to builder")?;
-
-            return Ok(RealExecutor {
-                inner: Inner::Builder(Arc::new((builder_client, signer))),
-                slippage_buffer: cfg.slippage_buffer,
-            });
-        }
+        let client = Client::new("https://clob.polymarket.com", clob_config)?
+            .authentication_builder(&signer)
+            .signature_type(SignatureType::GnosisSafe)
+            .authenticate()
+            .await
+            .context("CLOB V2 authentication failed")?;
 
         Ok(RealExecutor {
-            inner: Inner::Normal(Arc::new((normal_client, signer))),
+            client: Arc::new(client),
+            signer: Arc::new(signer),
             slippage_buffer: cfg.slippage_buffer,
         })
     }
@@ -136,50 +116,23 @@ impl Executor for RealExecutor {
         let size  = Decimal::from_str(&format!("{:.2}", raw_shares)).context("invalid shares")?;
         let price = Decimal::from_str(&format!("{:.2}", price_f)).context("invalid price")?;
 
-        match &self.inner {
-            Inner::Builder(pair) => {
-                let (client, signer) = pair.as_ref();
-                let signable = client
-                    .limit_order()
-                    .token_id(token_u256)
-                    .side(Side::Buy)
-                    .price(price)
-                    .size(size)
-                    .order_type(OrderType::FOK)
-                    .build()
-                    .await?;
-                let signed = client.sign(signer, signable).await?;
-                let resp   = client.post_order(signed).await?;
-                Ok(ExecResult {
-                    fill_price: price_f,
-                    shares: raw_shares,
-                    usdc: raw_shares * price_f,
-                    order_id: resp.order_id.to_string(),
-                    notes: format!("live_builder ask={:.4} buf={:.4}", params.ask_price, self.slippage_buffer),
-                })
-            }
-            Inner::Normal(pair) => {
-                let (client, signer) = pair.as_ref();
-                let signable = client
-                    .limit_order()
-                    .token_id(token_u256)
-                    .side(Side::Buy)
-                    .price(price)
-                    .size(size)
-                    .order_type(OrderType::FOK)
-                    .build()
-                    .await?;
-                let signed = client.sign(signer, signable).await?;
-                let resp   = client.post_order(signed).await?;
-                Ok(ExecResult {
-                    fill_price: price_f,
-                    shares: raw_shares,
-                    usdc: raw_shares * price_f,
-                    order_id: resp.order_id.to_string(),
-                    notes: format!("live_normal ask={:.4} buf={:.4}", params.ask_price, self.slippage_buffer),
-                })
-            }
-        }
+        let resp = self.client
+            .limit_order()
+            .token_id(token_u256)
+            .side(Side::Buy)
+            .price(price)
+            .size(size)
+            .order_type(OrderType::FOK)
+            .build_sign_and_post(&*self.signer)
+            .await?;
+
+        Ok(ExecResult {
+            fill_price: price_f,
+            shares:     raw_shares,
+            usdc:       raw_shares * price_f,
+            order_id:   resp.order_id.to_string(),
+            notes:      format!("live ask={:.4} buf={:.4}", params.ask_price, self.slippage_buffer),
+        })
     }
 
     fn is_live(&self) -> bool { true }
