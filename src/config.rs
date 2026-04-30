@@ -3,10 +3,10 @@ use std::env;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub market: String,          // "btc-5m", "btc-15m", "eth-5m", "eth-15m"
+    pub market: String,
     pub interval_secs: u64,
-    pub slug_prefix: String,     // "btc-updown-5m" etc.
-    pub asset: String,           // "BTC" or "ETH"
+    pub slug_prefix: String,
+    pub asset: String,
     pub order_usdc: f64,         // USDC to spend per trade (TRADE_AMOUNT in .env)
     pub slippage_buffer: f64,
     pub poll_ms: u64,
@@ -18,25 +18,39 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load_test() -> Result<Self> {
+    pub fn load_test(market: &str) -> Result<Self> {
         dotenvy::dotenv().ok();
-        Self::build(false)
+        Self::build(market, false)
     }
 
-    pub fn load_real() -> Result<Self> {
+    pub fn load_real(market: &str) -> Result<Self> {
         dotenvy::dotenv().ok();
-        Self::build(true)
+        Self::build(market, true)
     }
 
-    fn build(require_credentials: bool) -> Result<Self> {
-        let market = env::var("MARKET").unwrap_or_else(|_| "btc-5m".to_string());
+    fn build(market: &str, require_credentials: bool) -> Result<Self> {
+        let market = market.to_string();
 
         let (secs, slug_prefix, asset) = match market.as_str() {
-            "btc-5m"  => (300u64, "btc-updown-5m",  "BTC"),
-            "btc-15m" => (900u64, "btc-updown-15m", "BTC"),
-            "eth-5m"  => (300u64, "eth-updown-5m",  "ETH"),
-            "eth-15m" => (900u64, "eth-updown-15m", "ETH"),
-            other => bail!("MARKET must be btc-5m | btc-15m | eth-5m | eth-15m, got '{}'", other),
+            "btc-5m"   => (300u64, "btc-updown-5m",   "BTC"),
+            "btc-15m"  => (900u64, "btc-updown-15m",  "BTC"),
+            "eth-5m"   => (300u64, "eth-updown-5m",   "ETH"),
+            "eth-15m"  => (900u64, "eth-updown-15m",  "ETH"),
+            "sol-5m"   => (300u64, "sol-updown-5m",   "SOL"),
+            "sol-15m"  => (900u64, "sol-updown-15m",  "SOL"),
+            "bnb-5m"   => (300u64, "bnb-updown-5m",   "BNB"),
+            "bnb-15m"  => (900u64, "bnb-updown-15m",  "BNB"),
+            "xrp-5m"   => (300u64, "xrp-updown-5m",   "XRP"),
+            "xrp-15m"  => (900u64, "xrp-updown-15m",  "XRP"),
+            "doge-5m"  => (300u64, "doge-updown-5m",  "DOGE"),
+            "doge-15m" => (900u64, "doge-updown-15m", "DOGE"),
+            "hype-5m"  => (300u64, "hype-updown-5m",  "HYPE"),
+            "hype-15m" => (900u64, "hype-updown-15m", "HYPE"),
+            other => bail!(
+                "MARKET must be one of: btc-5m btc-15m eth-5m eth-15m sol-5m sol-15m \
+                 bnb-5m bnb-15m xrp-5m xrp-15m doge-5m doge-15m hype-5m hype-15m  \
+                 got '{}'", other
+            ),
         };
 
         // TRADE_AMOUNT is the primary env var; ORDER_USDC accepted for backward compat

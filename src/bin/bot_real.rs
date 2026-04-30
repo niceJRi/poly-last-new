@@ -1,7 +1,8 @@
 //! # bot_real — live trading mode
 //!
 //! Usage:
-//!   cargo run --bin bot_real
+//!   cargo run --bin bot_real -- <market>
+//!   cargo run --bin bot_real -- btc-5m
 //!
 //! REAL ORDERS ARE PLACED — ensure your wallet has USDC and all .env keys are set.
 
@@ -24,7 +25,13 @@ fn install_crypto() {
 async fn main() -> Result<()> {
     install_crypto();
 
-    let cfg = Config::load_real()?;
+    let market = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("Usage: bot_real <market>");
+        eprintln!("  Markets: btc-5m | btc-15m | eth-5m | eth-15m | sol-5m | sol-15m");
+        eprintln!("           bnb-5m | bnb-15m | xrp-5m | xrp-15m | doge-5m | doge-15m | hype-5m | hype-15m");
+        std::process::exit(1);
+    });
+    let cfg = Config::load_real(&market)?;
 
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║      {} Last-Minute Winner Bot  —  REAL / LIVE MODE            ║", cfg.asset);

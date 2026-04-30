@@ -1,10 +1,11 @@
 //! # bot_test — paper / simulation mode
 //!
 //! Usage:
-//!   cargo run --bin bot_test
+//!   cargo run --bin bot_test -- <market>
+//!   cargo run --bin bot_test -- btc-5m
 //!
 //! No real orders are placed; all execution is simulated at the ask price.
-//! Copy .env.example → .env and set MARKET, TRADE_AMOUNT, MAX_TRADES at minimum.
+//! Copy .env.example → .env and set TRADE_AMOUNT, MAX_TRADES at minimum.
 
 use std::sync::Arc;
 
@@ -25,7 +26,13 @@ fn install_crypto() {
 async fn main() -> Result<()> {
     install_crypto();
 
-    let cfg = Config::load_test()?;
+    let market = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("Usage: bot_test <market>");
+        eprintln!("  Markets: btc-5m | btc-15m | eth-5m | eth-15m | sol-5m | sol-15m");
+        eprintln!("           bnb-5m | bnb-15m | xrp-5m | xrp-15m | doge-5m | doge-15m | hype-5m | hype-15m");
+        std::process::exit(1);
+    });
+    let cfg = Config::load_test(&market)?;
 
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║      {} Last-Minute Winner Bot  —  TEST / PAPER MODE           ║", cfg.asset);

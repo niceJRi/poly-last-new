@@ -135,7 +135,15 @@ async fn ws_connect(symbol: &str, shared: &SharedPrice) -> anyhow::Result<()> {
 }
 
 fn rtds_symbol(asset: &str) -> &'static str {
-    if asset == "ETH" { "eth/usd" } else { "btc/usd" }
+    match asset {
+        "ETH"  => "eth/usd",
+        "SOL"  => "sol/usd",
+        "BNB"  => "bnb/usd",
+        "XRP"  => "xrp/usd",
+        "DOGE" => "doge/usd",
+        "HYPE" => "hype/usd",
+        _      => "btc/usd",   // BTC + fallback
+    }
 }
 
 fn now_secs() -> i64 {
