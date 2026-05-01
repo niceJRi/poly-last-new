@@ -2,6 +2,7 @@
 ///
 /// Per-market trades : data/<slug>_trades.csv
 /// PnL summary       : data/pnl_summary.csv
+/// Order errors      : log/<market>/errors.log
 use anyhow::Result;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -10,11 +11,31 @@ use std::path::Path;
 use crate::types::BotTrade;
 
 const DATA_DIR: &str = "data";
+const LOG_DIR:  &str = "log";
 
 fn ensure_data_dir() -> Result<()> {
     if !Path::new(DATA_DIR).exists() {
         fs::create_dir_all(DATA_DIR)?;
     }
+    Ok(())
+}
+
+fn error_log_path(market: &str) -> Result<String> {
+    let safe: String = market.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let dir = format!("{}/{}", LOG_DIR, safe);
+    fs::create_dir_all(&dir)?;
+    Ok(format!("{}/errors.log", dir))
+}
+
+/// Append one order error line to log/<market>/errors.log.
+/// Called only in real (live) mode so test runs stay silent.
+pub fn append_order_error(market: &str, context: &str, error: &str) -> Result<()> {
+    let path = error_log_path(market)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S UTC");
+    writeln!(file, "[{ts}] {context} | {error}")?;
     Ok(())
 }
 

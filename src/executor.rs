@@ -91,6 +91,10 @@ impl RealExecutor {
     }
 }
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 #[async_trait]
 impl Executor for RealExecutor {
     async fn execute_buy(&self, params: &BuyParams) -> Result<ExecResult> {
@@ -103,7 +107,27 @@ impl Executor for RealExecutor {
         let raw_price = (params.ask_price + self.slippage_buffer).clamp(0.01, 0.99);
         let price_f   = (raw_price * 100.0).round() / 100.0;
 
-        let order_value = raw_shares * price_f;
+        // CLOB V2 FOK: maker_amount = shares × price (USDC cost) must have ≤ 2 decimal
+        // places (i.e. be a whole number of cents).  For shares and price both at 2 dec,
+        // shares × price has ≤ 4 dec places.  We align shares DOWN to the nearest
+        // multiple that makes the product exact to cents.
+        //
+        // Math: shares_cents × price_cents must be divisible by 100.
+        //       The required step = 100 / gcd(price_cents, 100).
+        let price_cents  = (price_f * 100.0).round() as u64;
+        let step         = 100 / gcd(price_cents, 100);
+        let raw_cents    = (raw_shares * 100.0) as u64;
+        let adj_cents    = (raw_cents / step) * step;
+        let adj_shares   = adj_cents as f64 / 100.0;
+
+        if adj_shares < 0.01 {
+            return Err(anyhow::anyhow!(
+                "shares too small after cent-alignment: {:.2} (price={:.2})",
+                adj_shares, price_f,
+            ));
+        }
+
+        let order_value = adj_shares * price_f;
         if order_value < 1.0 {
             return Err(anyhow::anyhow!(
                 "order value ${:.3} is below $1.00 minimum",
@@ -113,7 +137,7 @@ impl Executor for RealExecutor {
 
         let token_u256 = U256::from_str(&params.token_id)
             .with_context(|| format!("bad token_id: {}", params.token_id))?;
-        let size  = Decimal::from_str(&format!("{:.2}", raw_shares)).context("invalid shares")?;
+        let size  = Decimal::from_str(&format!("{:.2}", adj_shares)).context("invalid shares")?;
         let price = Decimal::from_str(&format!("{:.2}", price_f)).context("invalid price")?;
 
         let resp = self.client
@@ -128,8 +152,8 @@ impl Executor for RealExecutor {
 
         Ok(ExecResult {
             fill_price: price_f,
-            shares:     raw_shares,
-            usdc:       raw_shares * price_f,
+            shares:     adj_shares,
+            usdc:       adj_shares * price_f,
             order_id:   resp.order_id.to_string(),
             notes:      format!("live ask={:.4} buf={:.4}", params.ask_price, self.slippage_buffer),
         })

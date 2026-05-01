@@ -472,7 +472,19 @@ async fn tick_just_ended(
                 state.all_trades.push(trade);
                 state.post_market_trades = state.bot_trades.clone();
             }
-            Err(e) => eprintln!("[ORDER] execute_buy failed: {}", e),
+            Err(e) => {
+                let err_str = e.to_string();
+                if executor.is_live() {
+                    let ctx = format!(
+                        "outcome={} shares={:.2} ask={:.4}",
+                        winner, params.shares, params.ask_price,
+                    );
+                    if let Err(le) = csv_log::append_order_error(&state.config.market, &ctx, &err_str) {
+                        eprintln!("[LOG] error log write failed: {}", le);
+                    }
+                }
+                eprintln!("[ORDER] execute_buy failed: {}", err_str);
+            }
         }
     }
 
