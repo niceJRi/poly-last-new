@@ -37,6 +37,9 @@ pub struct AppState {
     pub poll_count: u64,
     pub last_tick_ms: u64,
     pub status_line: String,
+    pub wallet_address: String,
+    pub usdc_balance: f64,
+    pub balance_poll_count: u64,
 
     // Price captured at the exact bucket boundary second — becomes the next market's beat price.
     pub next_beat_price: Option<f64>,
@@ -70,6 +73,9 @@ impl AppState {
             poll_count: 0,
             last_tick_ms: 0,
             status_line: "Initializing… connecting to Polymarket RTDS".to_string(),
+            wallet_address: String::new(),
+            usdc_balance: 0.0,
+            balance_poll_count: 0,
             next_beat_price: None,
             last_seen_bucket_ts: 0,
             post_market_orderbook: None,
@@ -98,6 +104,8 @@ pub struct RenderState {
     pub poll_count: u64,
     pub last_tick_ms: u64,
     pub status_line: String,
+    pub wallet_address: String,
+    pub usdc_balance: f64,
     pub post_market_orderbook: Option<Orderbook>,
     pub post_market_winner: String,
     pub post_market_end_price: f64,
@@ -126,6 +134,8 @@ impl RenderState {
             poll_count: s.poll_count,
             last_tick_ms: s.last_tick_ms,
             status_line: s.status_line.clone(),
+            wallet_address: s.wallet_address.clone(),
+            usdc_balance: s.usdc_balance,
             post_market_orderbook: s.post_market_orderbook.clone(),
             post_market_winner: s.post_market_winner.clone(),
             post_market_end_price: s.post_market_end_price,
@@ -142,6 +152,13 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
     let http = HttpClient::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
+
+    // Set wallet address once at startup
+    if let Some(addr) = executor.wallet_address() {
+        state.wallet_address = addr;
+    }
+    // Fetch initial balance
+    state.usdc_balance = executor.fetch_usdc_balance().await;
 
     // Start background Polymarket RTDS WebSocket (updates SharedPrice in real-time)
     let price_stream: SharedPrice = start_price_stream(http.clone(), &state.config.asset);
@@ -161,7 +178,14 @@ pub async fn run(mut state: AppState, executor: Arc<dyn Executor>) -> Result<()>
 
     loop {
         state.poll_count += 1;
+        state.balance_poll_count += 1;
         let t0 = Instant::now();
+
+        // Refresh USDC balance every ~30 s (150 ticks × 200 ms)
+        if state.balance_poll_count >= 150 {
+            state.balance_poll_count = 0;
+            state.usdc_balance = executor.fetch_usdc_balance().await;
+        }
 
         let current_bucket = current_bucket_ts(state.config.interval_secs);
         if current_bucket > state.last_seen_bucket_ts {

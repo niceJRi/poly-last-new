@@ -59,6 +59,20 @@ pub fn render(s: &RenderState) {
         CYAN, &tl, RESET,
     ));
 
+    // ── Wallet / balance (real mode only) ─────────────────────────────────────
+    if s.is_live {
+        let bal_color = if s.usdc_balance >= 1.0 { GREEN } else { RED };
+        let wallet = if s.wallet_address.is_empty() {
+            "deriving…".to_string()
+        } else {
+            format!("{}…{}", &s.wallet_address[..6], &s.wallet_address[s.wallet_address.len()-4..])
+        };
+        wl(&mut buf, &format!("  {}Wallet :{} {}   {}{}Balance: ${:.2}{}",
+            DIM, RESET, wallet,
+            bal_color, BOLD, s.usdc_balance, RESET,
+        ));
+    }
+
     // ── Price vs Beat Price ───────────────────────────────────────────────────
     wl(&mut buf, "");
     wl(&mut buf, &format!("  {}──── {} Price vs Beat Price ──────────────────────────────{}", DIM, s.config.asset, RESET));

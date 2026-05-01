@@ -10,6 +10,8 @@ use crate::types::{BuyParams, ExecResult};
 pub trait Executor: Send + Sync {
     async fn execute_buy(&self, params: &BuyParams) -> Result<ExecResult>;
     fn is_live(&self) -> bool;
+    fn wallet_address(&self) -> Option<String>;
+    async fn fetch_usdc_balance(&self) -> f64;
 }
 
 // ── Test (paper) executor ─────────────────────────────────────────────────────
@@ -31,6 +33,8 @@ impl Executor for TestExecutor {
     }
 
     fn is_live(&self) -> bool { false }
+    fn wallet_address(&self) -> Option<String> { None }
+    async fn fetch_usdc_balance(&self) -> f64 { 0.0 }
 }
 
 // ── Real executor ─────────────────────────────────────────────────────────────
@@ -46,16 +50,18 @@ use rust_decimal::Decimal;
 
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::types::{AssetType, OrderStatusType, OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
-use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::{derive_safe_wallet, POLYGON};
 
 use crate::config::Config;
 
 pub struct RealExecutor {
-    client:  Arc<Client<Authenticated<Normal>>>,
-    signer:  Arc<PrivateKeySigner>,
+    client:          Arc<Client<Authenticated<Normal>>>,
+    signer:          Arc<PrivateKeySigner>,
     slippage_buffer: f64,
+    proxy_wallet:    Option<String>,
 }
 
 impl RealExecutor {
@@ -83,10 +89,15 @@ impl RealExecutor {
             .await
             .context("CLOB V2 authentication failed")?;
 
+        // Derive the Gnosis Safe proxy wallet address (same derivation the SDK uses internally).
+        let proxy_wallet = derive_safe_wallet(signer.address(), POLYGON)
+            .map(|addr| format!("{addr:#x}"));
+
         Ok(RealExecutor {
             client: Arc::new(client),
             signer: Arc::new(signer),
             slippage_buffer: cfg.slippage_buffer,
+            proxy_wallet,
         })
     }
 }
@@ -150,14 +161,92 @@ impl Executor for RealExecutor {
             .build_sign_and_post(&*self.signer)
             .await?;
 
+        // ── Step 1: check the immediate API response ───────────────────────────
+        // HTTP 200 does NOT guarantee a fill — status=Matched is only the off-chain
+        // CLOB match; the Polygon settlement transaction is submitted asynchronously.
+        if !resp.success || resp.status != OrderStatusType::Matched {
+            return Err(anyhow::anyhow!(
+                "order not filled: status={:?} success={} error={} orderID={}",
+                resp.status, resp.success,
+                resp.error_msg.as_deref().unwrap_or("none"),
+                resp.order_id,
+            ));
+        }
+
+        // Empty trade_ids means the CLOB matched but registered no actual trade.
+        if resp.trade_ids.is_empty() {
+            return Err(anyhow::anyhow!(
+                "order MATCHED but no trade IDs registered (phantom match) — orderID={}",
+                resp.order_id,
+            ));
+        }
+
+        // ── Step 2: confirm on-chain settlement via USDC balance ───────────────
+        // Polygon block time ≈ 2 s; poll up to 6 s for the balance to decrease.
+        // The balance only decreases after the on-chain transaction is mined.
+        // If the market is resolving and the exchange rejects the tx, balance stays
+        // unchanged and we treat the order as failed.
+        let expected_usdc = adj_shares * price_f;
+        let balance_before = self.fetch_usdc_balance().await;
+        let settled = self.wait_for_settlement(balance_before, expected_usdc * 0.5).await;
+        if !settled {
+            return Err(anyhow::anyhow!(
+                "order MATCHED but USDC balance unchanged after 6s (balance=${:.2}) — \
+                 on-chain settlement failed: orderID={}",
+                balance_before, resp.order_id,
+            ));
+        }
+
+        // ── Step 3: record the actual fill ────────────────────────────────────
+        // Use response amounts when available; fall back to our calculated values.
+        let filled_shares = if resp.taking_amount > Decimal::ZERO {
+            resp.taking_amount.try_into().unwrap_or(adj_shares)
+        } else {
+            adj_shares
+        };
+        let filled_usdc = if resp.making_amount > Decimal::ZERO {
+            resp.making_amount.try_into().unwrap_or(expected_usdc)
+        } else {
+            expected_usdc
+        };
+
         Ok(ExecResult {
             fill_price: price_f,
-            shares:     adj_shares,
-            usdc:       adj_shares * price_f,
+            shares:     filled_shares,
+            usdc:       filled_usdc,
             order_id:   resp.order_id.to_string(),
             notes:      format!("live ask={:.4} buf={:.4}", params.ask_price, self.slippage_buffer),
         })
     }
 
     fn is_live(&self) -> bool { true }
+
+    fn wallet_address(&self) -> Option<String> {
+        self.proxy_wallet.clone()
+    }
+
+    async fn fetch_usdc_balance(&self) -> f64 {
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        self.client.balance_allowance(req).await
+            .map(|r| r.balance.try_into().unwrap_or(0.0))
+            .unwrap_or(0.0)
+    }
+
+}
+
+impl RealExecutor {
+    /// Poll the USDC balance every 500 ms until it drops by at least `min_drop`
+    /// (confirming on-chain settlement), or until 6 seconds have elapsed.
+    async fn wait_for_settlement(&self, balance_before: f64, min_drop: f64) -> bool {
+        for _ in 0..12 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let now = self.fetch_usdc_balance().await;
+            if balance_before - now >= min_drop {
+                return true;
+            }
+        }
+        false
+    }
 }
