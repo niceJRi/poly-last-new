@@ -12,6 +12,7 @@ pub struct Config {
     pub poll_ms: u64,
     pub post_market_secs: u64,   // seconds to keep post-market window open
     pub max_trades_per_market: usize, // 0 = unlimited (MAX_TRADES in .env)
+    pub order_level_skip: usize,      // ask levels to jump on FOK failure (ORDER_LEVEL_SKIP in .env)
     // real-mode credentials
     pub private_key: Option<String>,
     pub builder_code: Option<String>,  // 32-byte hex builder attribution code (CLOB V2)
@@ -76,6 +77,11 @@ impl Config {
             .parse()
             .context("MAX_TRADES must be a whole number")?;
 
+        let order_level_skip: usize = env::var("ORDER_LEVEL_SKIP")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse()
+            .context("ORDER_LEVEL_SKIP must be a whole number")?;
+
         let (pk, builder_code) = if require_credentials {
             let pk   = env::var("POLYMARKET_PRIVATE_KEY").context("POLYMARKET_PRIVATE_KEY not set")?;
             let code = env::var("POLYMARKET_BUILDER_CODE").ok(); // optional
@@ -94,6 +100,7 @@ impl Config {
             poll_ms: 200,
             post_market_secs: 25,
             max_trades_per_market: max_trades,
+            order_level_skip,
             private_key: pk,
             builder_code,
         })

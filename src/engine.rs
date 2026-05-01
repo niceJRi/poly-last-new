@@ -427,19 +427,22 @@ async fn tick_just_ended(
         return Ok(());
     }
 
-    // Walk asks cheapest-first, spend up to TRADE_AMOUNT budget per tick
+    // FOK order logic: try one ask level at a time.
+    // On failure, immediately retry at index + ORDER_LEVEL_SKIP (next price level up).
+    // FOK matches the whole book at or below the limit price, so don't cap by single-level size.
     let budget = state.config.order_usdc;
-    let mut rem_budget          = budget;
-    let mut orders_placed       = 0usize;
-    let mut total_shares_bought = 0.0f64;
-    let mut total_usdc_spent    = 0.0f64;
+    let skip   = state.config.order_level_skip.max(1);
+    let mut idx = 0;
+    let mut trade_placed: Option<BotTrade> = None;
 
-    for ask in &tradeable {
-        if rem_budget < 1.0 { break; }
+    while idx < tradeable.len() {
+        let ask = &tradeable[idx];
 
-        let shares_to_buy = (rem_budget / ask.price).min(ask.size);
-        let cost          = shares_to_buy * ask.price;
-        if cost < 1.0 { break; }
+        let shares_to_buy = budget / ask.price;
+        if shares_to_buy * ask.price < 1.0 {
+            idx += skip;
+            continue;
+        }
 
         let params = BuyParams {
             token_id:        winner_token.clone(),
@@ -464,13 +467,11 @@ async fn tick_just_ended(
                 if let Err(e) = csv_log::append_trade(&trade) {
                     eprintln!("[CSV] write error: {}", e);
                 }
-                rem_budget          -= res.usdc;
-                total_shares_bought += res.shares;
-                total_usdc_spent    += res.usdc;
-                orders_placed       += 1;
                 state.bot_trades.push(trade.clone());
-                state.all_trades.push(trade);
+                state.all_trades.push(trade.clone());
                 state.post_market_trades = state.bot_trades.clone();
+                trade_placed = Some(trade);
+                break; // one fill per tick
             }
             Err(e) => {
                 let err_str = e.to_string();
@@ -483,21 +484,23 @@ async fn tick_just_ended(
                         eprintln!("[LOG] error log write failed: {}", le);
                     }
                 }
-                eprintln!("[ORDER] execute_buy failed: {}", err_str);
+                eprintln!("[ORDER] failed ask[{}]={:.4}: {}", idx, ask.price, err_str);
+                idx += skip; // move to next price level immediately
             }
         }
     }
 
-    state.status_line = if orders_placed > 0 {
+    state.status_line = if let Some(ref t) = trade_placed {
         format!(
-            "Winner: {}  Bought {:.3} shares for ${:.2} ({} order(s))  Beat: ${:.2}  End: ${:.2}  Window: {}s",
-            winner.to_uppercase(), total_shares_bought, total_usdc_spent, orders_placed,
+            "Winner: {}  Bought {:.3} shares for ${:.2}  Beat: ${:.2}  End: ${:.2}  Window: {}s",
+            winner.to_uppercase(), t.shares, t.usdc_spent,
             state.beat_price, end_price, remaining,
         )
     } else {
         format!(
-            "Winner: {}  Asks present but below $1 min order  Beat: ${:.2}  End: ${:.2}  Window: {}s",
-            winner.to_uppercase(), state.beat_price, end_price, remaining,
+            "Winner: {}  No fill (tried {} levels)  Beat: ${:.2}  End: ${:.2}  Window: {}s",
+            winner.to_uppercase(), tradeable.len(),
+            state.beat_price, end_price, remaining,
         )
     };
 
